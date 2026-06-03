@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "repo-onboard"
+version = "0.1.0"
+description = "CLI agent that scans local repositories and produces onboarding reports."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+llm = ["openai>=1.0.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+onboard = "onboard.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
