@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -170,6 +171,8 @@ def infer_command_hints(root: Path, paths: Iterable[Path]) -> list[CommandHint]:
 
     if "Makefile" in names:
         hints.append(CommandHint("make", "Project includes a Makefile with automation targets."))
+        for target in _targets_from_makefile(root / "Makefile"):
+            hints.append(CommandHint(f"make {target}", f"Makefile defines the '{target}' target."))
     if "pyproject.toml" in names:
         hints.append(CommandHint("python -m pytest", "Common Python test command when pytest is configured."))
     if "requirements.txt" in names:
@@ -185,6 +188,58 @@ def infer_command_hints(root: Path, paths: Iterable[Path]) -> list[CommandHint]:
     if "go.mod" in names:
         hints.append(CommandHint("go test ./...", "Run Go tests across the module."))
 
+    return hints
+
+
+def infer_project_purpose(root: Path, paths: Iterable[Path]) -> str | None:
+    relative_paths = list(paths)
+    names = {path.name for path in relative_paths}
+    for readme_name in ("README.md", "README.rst", "README.txt"):
+        if readme_name in names:
+            purpose = _purpose_from_readme(root / readme_name)
+            if purpose:
+                return purpose
+
+    package_json = root / "package.json"
+    if package_json.exists():
+        purpose = _purpose_from_package_json(package_json)
+        if purpose:
+            return purpose
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        purpose = _purpose_from_pyproject(pyproject)
+        if purpose:
+            return purpose
+    return None
+
+
+def infer_module_hints(paths: Iterable[Path]) -> list[str]:
+    relative_paths = list(paths)
+    hints: list[str] = []
+    top_level_dirs = sorted({path.parts[0] for path in relative_paths if len(path.parts) > 1})
+    common_roles = {
+        "src": "Source package root.",
+        "app": "Application code.",
+        "backend": "Backend service code.",
+        "frontend": "Frontend application code.",
+        "tests": "Automated tests.",
+        "docs": "Project documentation.",
+        "scripts": "Developer or deployment scripts.",
+        "config": "Configuration files.",
+        ".github": "GitHub automation and CI configuration.",
+    }
+    for directory in top_level_dirs:
+        reason = common_roles.get(directory)
+        if reason:
+            hints.append(f"`{directory}/`: {reason}")
+
+    src_children = sorted({path.parts[1] for path in relative_paths if len(path.parts) > 2 and path.parts[0] == "src"})
+    for child in src_children[:5]:
+        hints.append(f"`src/{child}/`: Python/package module or source namespace.")
+
+    if not hints and top_level_dirs:
+        hints.append(f"Top-level directories detected: {', '.join(f'`{name}/`' for name in top_level_dirs[:8])}.")
     return hints
 
 
@@ -225,9 +280,63 @@ def _scripts_from_package_json(path: Path) -> set[str]:
     return set(scripts)
 
 
+def _targets_from_makefile(path: Path) -> list[str]:
+    text = _safe_read(path)
+    targets: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("\t") or line.startswith("#"):
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+):(?:\s|$)", line)
+        if not match:
+            continue
+        target = match.group(1)
+        if target not in targets and not target.startswith("."):
+            targets.append(target)
+    return targets[:8]
+
+
+def _purpose_from_readme(path: Path) -> str | None:
+    text = _safe_read(path)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    heading = lines[0].lstrip("# ").strip()
+    paragraph = next((line for line in lines[1:] if not line.startswith("#") and not line.startswith("```")), "")
+    if paragraph:
+        return f"{heading}: {paragraph}" if heading else paragraph
+    return heading or None
+
+
+def _purpose_from_package_json(path: Path) -> str | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    name = data.get("name")
+    description = data.get("description")
+    if name and description:
+        return f"{name}: {description}"
+    return description or name
+
+
+def _purpose_from_pyproject(path: Path) -> str | None:
+    text = _safe_read(path)
+    name = _first_toml_string(text, "name")
+    description = _first_toml_string(text, "description")
+    if name and description:
+        return f"{name}: {description}"
+    return description or name
+
+
+def _first_toml_string(text: str, key: str) -> str | None:
+    match = re.search(rf"^{re.escape(key)}\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1)
+
+
 def _safe_read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
-

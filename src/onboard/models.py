@@ -16,6 +16,14 @@ class CommandHint:
     reason: str
 
 
+@dataclass(frozen=True)
+class FileSnippet:
+    path: str
+    reason: str
+    content: str
+    truncated: bool
+
+
 @dataclass
 class RepoAnalysis:
     root: Path
@@ -31,5 +39,8 @@ class RepoAnalysis:
     test_locations: list[str] = field(default_factory=list)
     config_files: list[str] = field(default_factory=list)
     command_hints: list[CommandHint] = field(default_factory=list)
+    project_purpose: str | None = None
+    module_hints: list[str] = field(default_factory=list)
+    file_snippets: list[FileSnippet] = field(default_factory=list)
+    maintainer_questions: list[str] = field(default_factory=list)
     uncertainties: list[str] = field(default_factory=list)
-

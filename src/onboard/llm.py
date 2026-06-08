@@ -104,6 +104,14 @@ def _build_prompt(analysis: RepoAnalysis) -> str:
             f"Entry points: {[item.path for item in analysis.entry_points]}",
             f"Tests: {analysis.test_locations}",
             f"Commands: {[hint.command for hint in analysis.command_hints]}",
+            f"Project purpose: {analysis.project_purpose}",
+            f"Module hints: {analysis.module_hints}",
+            "Curated snippets:",
+            *[
+                f"- {snippet.path}: {snippet.content[:1200]}"
+                for snippet in analysis.file_snippets[:8]
+            ],
             f"Uncertainties: {analysis.uncertainties}",
+            f"Maintainer questions: {analysis.maintainer_questions}",
         ]
     )

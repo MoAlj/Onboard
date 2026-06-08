@@ -4,7 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import detectors
-from .models import ImportantFile, RepoAnalysis
+from .models import FileSnippet, ImportantFile, RepoAnalysis
 
 IGNORED_DIRS = {
     ".git",
@@ -25,8 +25,33 @@ IGNORED_DIRS = {
     ".turbo",
 }
 
+SECRET_LIKE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
 
-def scan_repo(repo_path: str | Path, max_files: int = 500) -> RepoAnalysis:
+SNIPPET_FILE_NAMES = {
+    "README.md",
+    "README.rst",
+    "README.txt",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "Makefile",
+}
+
+
+def scan_repo(repo_path: str | Path, max_files: int = 500, snippet_bytes: int = 4000) -> RepoAnalysis:
     root = Path(repo_path).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Repository path does not exist: {root}")
@@ -34,6 +59,8 @@ def scan_repo(repo_path: str | Path, max_files: int = 500) -> RepoAnalysis:
         raise NotADirectoryError(f"Repository path is not a directory: {root}")
     if max_files < 1:
         raise ValueError("--max-files must be at least 1")
+    if snippet_bytes < 0:
+        raise ValueError("--snippet-bytes must be 0 or greater")
 
     files = _collect_files(root, max_files)
     all_count = _count_files(root, limit=max_files + 1)
@@ -61,7 +88,11 @@ def scan_repo(repo_path: str | Path, max_files: int = 500) -> RepoAnalysis:
     package_managers = detectors.detect_package_managers(relative_files)
     frameworks = detectors.detect_frameworks(root, relative_files)
     command_hints = detectors.infer_command_hints(root, relative_files)
+    project_purpose = detectors.infer_project_purpose(root, relative_files)
+    module_hints = detectors.infer_module_hints(relative_files)
+    file_snippets = _collect_snippets(root, important_files, entry_points, relative_files, snippet_bytes)
     uncertainties = _infer_uncertainties(relative_files, entry_points, command_hints, truncated)
+    maintainer_questions = _infer_maintainer_questions(relative_files, entry_points, command_hints, test_locations)
 
     return RepoAnalysis(
         root=root,
@@ -77,6 +108,10 @@ def scan_repo(repo_path: str | Path, max_files: int = 500) -> RepoAnalysis:
         test_locations=sorted(test_locations),
         config_files=sorted(config_files),
         command_hints=command_hints,
+        project_purpose=project_purpose,
+        module_hints=module_hints,
+        file_snippets=file_snippets,
+        maintainer_questions=maintainer_questions,
         uncertainties=uncertainties,
     )
 
@@ -111,6 +146,65 @@ def _append_tree_lines(tree: dict[str, dict], lines: list[str], max_entries: int
 
 def _count_tree_entries(tree: dict[str, dict]) -> int:
     return sum(1 + _count_tree_entries(children) for children in tree.values())
+
+
+def _collect_snippets(
+    root: Path,
+    important_files: list[ImportantFile],
+    entry_points: list[ImportantFile],
+    relative_files: list[Path],
+    snippet_bytes: int,
+) -> list[FileSnippet]:
+    if snippet_bytes == 0:
+        return []
+
+    snippet_candidates: dict[str, str] = {}
+    for item in important_files:
+        snippet_candidates[item.path] = item.reason
+    for item in entry_points:
+        snippet_candidates[item.path] = item.reason
+    for relative in relative_files:
+        if relative.name in SNIPPET_FILE_NAMES or relative.match(".github/workflows/*"):
+            snippet_candidates.setdefault(str(relative), "Relevant project metadata or automation file.")
+
+    snippets: list[FileSnippet] = []
+    for relative_path, reason in sorted(snippet_candidates.items()):
+        relative = Path(relative_path)
+        if _should_skip_snippet(relative):
+            continue
+        snippet = _read_text_snippet(root / relative, snippet_bytes)
+        if snippet is None:
+            continue
+        content, truncated = snippet
+        snippets.append(FileSnippet(path=relative_path, reason=reason, content=content, truncated=truncated))
+    return snippets
+
+
+def _should_skip_snippet(path: Path) -> bool:
+    lower_name = path.name.lower()
+    if lower_name in SECRET_LIKE_NAMES:
+        return True
+    if lower_name.endswith((".pem", ".key", ".p12", ".pfx")):
+        return True
+    if "secret" in lower_name or "credential" in lower_name:
+        return True
+    return False
+
+
+def _read_text_snippet(path: Path, snippet_bytes: int) -> tuple[str, bool] | None:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    truncated = len(raw) > snippet_bytes
+    raw = raw[:snippet_bytes]
+    if b"\x00" in raw:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text.strip(), truncated
 
 
 def _collect_files(root: Path, max_files: int) -> list[Path]:
@@ -171,6 +265,29 @@ def _infer_uncertainties(
         uncertainties.append("No obvious runtime entry point was detected.")
     if not command_hints:
         uncertainties.append("No clear local run or test commands were inferred.")
+    if len(entry_points) > 3:
+        uncertainties.append("Multiple possible entry points were detected; confirm the main runtime path.")
     if truncated:
         uncertainties.append("The scan hit the file limit; increase --max-files for a fuller report.")
     return uncertainties
+
+
+def _infer_maintainer_questions(
+    relative_files: list[Path],
+    entry_points: list[ImportantFile],
+    command_hints,
+    test_locations: set[str],
+) -> list[str]:
+    names = {path.name for path in relative_files}
+    questions: list[str] = []
+    if "README.md" not in names and "README.rst" not in names and "README.txt" not in names:
+        questions.append("What is the intended user-facing purpose of this project?")
+    if not entry_points:
+        questions.append("What is the canonical application entry point?")
+    if not command_hints:
+        questions.append("Which command should a new developer run first locally?")
+    if not test_locations:
+        questions.append("Where are the automated tests, or are they not added yet?")
+    if "Dockerfile" in names:
+        questions.append("Is Docker the recommended local development path or only a deployment artifact?")
+    return questions

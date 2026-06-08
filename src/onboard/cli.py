@@ -29,13 +29,14 @@ def _build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--output", "-o", help="Write the Markdown report to this file.")
     scan.add_argument("--no-llm", action="store_true", help="Disable optional LLM-generated explanation.")
     scan.add_argument("--max-files", type=int, default=500, help="Maximum number of files to scan.")
+    scan.add_argument("--snippet-bytes", type=int, default=4000, help="Maximum bytes to read from each relevant text file.")
     scan.add_argument("--verbose", action="store_true", help="Print scan progress details to stderr.")
     return parser
 
 
 def _scan_command(args: argparse.Namespace) -> int:
     try:
-        analysis = scan_repo(args.repo_path, max_files=args.max_files)
+        analysis = scan_repo(args.repo_path, max_files=args.max_files, snippet_bytes=args.snippet_bytes)
     except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -55,4 +56,3 @@ def _scan_command(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

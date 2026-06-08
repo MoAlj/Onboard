@@ -44,6 +44,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("main.py", content)
 
+    def test_cli_accepts_snippet_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "README.md").write_text("# Demo\n\n" + "x" * 100, encoding="utf-8")
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = main(["scan", str(repo), "--no-llm", "--snippet-bytes", "10"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("gekuerzt", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
