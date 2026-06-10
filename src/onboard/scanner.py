@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from pathlib import Path
 
 from . import detectors
-from .models import FileSnippet, ImportantFile, RepoAnalysis
+from .models import CommandHint, FileSnippet, ImportEdge, ImportantFile, RepoAnalysis
 
 IGNORED_DIRS = {
     ".git",
@@ -88,8 +89,12 @@ def scan_repo(repo_path: str | Path, max_files: int = 500, snippet_bytes: int = 
     package_managers = detectors.detect_package_managers(relative_files)
     frameworks = detectors.detect_frameworks(root, relative_files)
     command_hints = detectors.infer_command_hints(root, relative_files)
+    package_scripts = _infer_package_scripts(root, relative_files)
+    make_targets = _infer_make_targets(root, relative_files)
     project_purpose = detectors.infer_project_purpose(root, relative_files)
     module_hints = detectors.infer_module_hints(relative_files)
+    architecture_roles = detectors.infer_architecture_roles(relative_files)
+    import_graph = _build_import_graph(root, relative_files)
     file_snippets = _collect_snippets(root, important_files, entry_points, relative_files, snippet_bytes)
     uncertainties = _infer_uncertainties(relative_files, entry_points, command_hints, truncated)
     maintainer_questions = _infer_maintainer_questions(relative_files, entry_points, command_hints, test_locations)
@@ -108,6 +113,10 @@ def scan_repo(repo_path: str | Path, max_files: int = 500, snippet_bytes: int = 
         test_locations=sorted(test_locations),
         config_files=sorted(config_files),
         command_hints=command_hints,
+        package_scripts=package_scripts,
+        make_targets=make_targets,
+        import_graph=import_graph,
+        architecture_roles=architecture_roles,
         project_purpose=project_purpose,
         module_hints=module_hints,
         file_snippets=file_snippets,
@@ -146,6 +155,90 @@ def _append_tree_lines(tree: dict[str, dict], lines: list[str], max_entries: int
 
 def _count_tree_entries(tree: dict[str, dict]) -> int:
     return sum(1 + _count_tree_entries(children) for children in tree.values())
+
+
+def _infer_package_scripts(root: Path, relative_files: list[Path]) -> list[CommandHint]:
+    if "package.json" not in {path.name for path in relative_files}:
+        return []
+    return detectors.infer_package_scripts(root / "package.json")
+
+
+def _infer_make_targets(root: Path, relative_files: list[Path]) -> list[CommandHint]:
+    if "Makefile" not in {path.name for path in relative_files}:
+        return []
+    return detectors.infer_make_targets(root / "Makefile")
+
+
+def _build_import_graph(root: Path, relative_files: list[Path], max_nodes: int = 80) -> list[ImportEdge]:
+    python_files = [path for path in relative_files if path.suffix == ".py"]
+    internal_modules = _internal_python_modules(relative_files)
+    edges: list[ImportEdge] = []
+    for relative in python_files[:max_nodes]:
+        imports = _imports_from_python_file(root / relative, relative)
+        if not imports:
+            continue
+        internal = [module for module in imports if _is_internal_import(module, internal_modules)]
+        edges.append(ImportEdge(source=str(relative), imports=imports, internal_imports=internal))
+    return edges
+
+
+def _imports_from_python_file(path: Path, relative: Path) -> list[str]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return []
+
+    module_name = _module_name_for_path(relative)
+    current_package = module_name.split(".")[:-1] if module_name else []
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = _resolve_import_from(node, current_package)
+            if module:
+                imports.add(module)
+    return sorted(imports)
+
+
+def _resolve_import_from(node: ast.ImportFrom, current_package: list[str]) -> str | None:
+    if node.level == 0:
+        return node.module
+    base_length = max(0, len(current_package) - node.level + 1)
+    parts = current_package[:base_length]
+    if node.module:
+        parts.extend(node.module.split("."))
+    return ".".join(part for part in parts if part)
+
+
+def _module_name_for_path(path: Path) -> str:
+    parts = list(path.with_suffix("").parts)
+    if parts and parts[0] == "src":
+        parts = parts[1:]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _internal_python_modules(relative_files: list[Path]) -> set[str]:
+    modules: set[str] = set()
+    for path in relative_files:
+        if path.suffix != ".py":
+            continue
+        module_name = _module_name_for_path(path)
+        if module_name:
+            modules.add(module_name.split(".")[0])
+        if path.name == "__init__.py" and len(path.parts) >= 2:
+            if path.parts[0] == "src" and len(path.parts) >= 3:
+                modules.add(path.parts[1])
+            else:
+                modules.add(path.parts[0])
+    return modules
+
+
+def _is_internal_import(module: str, internal_modules: set[str]) -> bool:
+    top_level = module.split(".", 1)[0]
+    return top_level in internal_modules
 
 
 def _collect_snippets(

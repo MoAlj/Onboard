@@ -171,23 +171,63 @@ def infer_command_hints(root: Path, paths: Iterable[Path]) -> list[CommandHint]:
 
     if "Makefile" in names:
         hints.append(CommandHint("make", "Project includes a Makefile with automation targets."))
-        for target in _targets_from_makefile(root / "Makefile"):
-            hints.append(CommandHint(f"make {target}", f"Makefile defines the '{target}' target."))
+        hints.extend(infer_make_targets(root / "Makefile"))
     if "pyproject.toml" in names:
         hints.append(CommandHint("python -m pytest", "Common Python test command when pytest is configured."))
     if "requirements.txt" in names:
         hints.append(CommandHint("python -m pip install -r requirements.txt", "Install Python dependencies from requirements.txt."))
     if "package.json" in names:
-        scripts = _scripts_from_package_json(root / "package.json")
-        for script in ("dev", "start", "test", "build"):
-            if script in scripts:
-                hints.append(CommandHint(f"npm run {script}", f"package.json defines the '{script}' script."))
+        hints.extend(infer_package_scripts(root / "package.json"))
     if "Cargo.toml" in names:
         hints.append(CommandHint("cargo test", "Run Rust tests."))
         hints.append(CommandHint("cargo run", "Run the Rust binary if one exists."))
     if "go.mod" in names:
         hints.append(CommandHint("go test ./...", "Run Go tests across the module."))
 
+    return hints
+
+
+def infer_package_scripts(path: Path) -> list[CommandHint]:
+    scripts = _scripts_from_package_json(path)
+    hints: list[CommandHint] = []
+    known_reasons = {
+        "dev": "Starts the development server or watcher.",
+        "start": "Starts the application in its default runtime mode.",
+        "test": "Runs the project test suite.",
+        "build": "Builds production artifacts.",
+        "lint": "Runs static checks or linting.",
+        "format": "Formats source files.",
+        "typecheck": "Runs TypeScript or static type checks.",
+        "preview": "Previews a production build locally.",
+        "clean": "Removes generated artifacts.",
+    }
+    for script, body in scripts.items():
+        reason = known_reasons.get(script, "package.json script.")
+        if body:
+            reason = f"{reason} Script body: `{body}`."
+        hints.append(CommandHint(f"npm run {script}", reason))
+    return hints
+
+
+def infer_make_targets(path: Path) -> list[CommandHint]:
+    targets = _targets_from_makefile(path)
+    known_reasons = {
+        "test": "Runs tests.",
+        "run": "Runs the application.",
+        "dev": "Starts a development workflow.",
+        "build": "Builds project artifacts.",
+        "lint": "Runs linting or static checks.",
+        "format": "Formats source files.",
+        "clean": "Removes generated artifacts.",
+        "install": "Installs dependencies or local tooling.",
+    }
+    hints: list[CommandHint] = []
+    for target, recipe in targets.items():
+        reason = known_reasons.get(target, "Makefile target.")
+        if recipe:
+            preview = " && ".join(recipe[:2])
+            reason = f"{reason} Recipe preview: `{preview}`."
+        hints.append(CommandHint(f"make {target}", reason))
     return hints
 
 
@@ -243,6 +283,34 @@ def infer_module_hints(paths: Iterable[Path]) -> list[str]:
     return hints
 
 
+def infer_architecture_roles(paths: Iterable[Path]) -> list[str]:
+    role_names = {
+        "api": "API boundary or endpoint definitions.",
+        "routes": "HTTP route definitions.",
+        "models": "Domain, database, or validation models.",
+        "services": "Business logic or integration services.",
+        "components": "Reusable UI components.",
+        "pages": "Page-level UI routes or views.",
+        "migrations": "Database/schema migrations.",
+    }
+    roles: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if len(path.parts) < 2:
+            continue
+        for index, part in enumerate(path.parts[:-1]):
+            role = role_names.get(part)
+            if role is None:
+                continue
+            prefix = Path(*path.parts[: index + 1])
+            key = str(prefix)
+            if key in seen:
+                continue
+            seen.add(key)
+            roles.append(f"`{key}/`: {role}")
+    return sorted(roles)
+
+
 def _frameworks_from_package_json(path: Path) -> set[str]:
     frameworks: set[str] = set()
     try:
@@ -269,30 +337,39 @@ def _frameworks_from_package_json(path: Path) -> set[str]:
     return frameworks
 
 
-def _scripts_from_package_json(path: Path) -> set[str]:
+def _scripts_from_package_json(path: Path) -> dict[str, str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return set()
+        return {}
     scripts = data.get("scripts", {})
     if not isinstance(scripts, dict):
-        return set()
-    return set(scripts)
+        return {}
+    return {str(name): str(command) for name, command in scripts.items()}
 
 
-def _targets_from_makefile(path: Path) -> list[str]:
+def _targets_from_makefile(path: Path) -> dict[str, list[str]]:
     text = _safe_read(path)
-    targets: list[str] = []
+    targets: dict[str, list[str]] = {}
+    current_target: str | None = None
     for line in text.splitlines():
-        if line.startswith("\t") or line.startswith("#"):
+        if line.startswith("\t"):
+            if current_target is not None:
+                recipe = line.strip()
+                if recipe and len(targets[current_target]) < 3:
+                    targets[current_target].append(recipe)
+            continue
+        current_target = None
+        if line.startswith("#"):
             continue
         match = re.match(r"^([A-Za-z0-9_.-]+):(?:\s|$)", line)
         if not match:
             continue
         target = match.group(1)
         if target not in targets and not target.startswith("."):
-            targets.append(target)
-    return targets[:8]
+            targets[target] = []
+            current_target = target
+    return dict(list(targets.items())[:12])
 
 
 def _purpose_from_readme(path: Path) -> str | None:

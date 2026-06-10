@@ -24,6 +24,13 @@ class FileSnippet:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class ImportEdge:
+    source: str
+    imports: list[str]
+    internal_imports: list[str]
+
+
 @dataclass
 class RepoAnalysis:
     root: Path
@@ -39,6 +46,10 @@ class RepoAnalysis:
     test_locations: list[str] = field(default_factory=list)
     config_files: list[str] = field(default_factory=list)
     command_hints: list[CommandHint] = field(default_factory=list)
+    package_scripts: list[CommandHint] = field(default_factory=list)
+    make_targets: list[CommandHint] = field(default_factory=list)
+    import_graph: list[ImportEdge] = field(default_factory=list)
+    architecture_roles: list[str] = field(default_factory=list)
     project_purpose: str | None = None
     module_hints: list[str] = field(default_factory=list)
     file_snippets: list[FileSnippet] = field(default_factory=list)

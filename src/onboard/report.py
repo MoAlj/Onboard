@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
+
+from .llm import LlmResult
 from .models import RepoAnalysis
 
 
-def build_markdown_report(analysis: RepoAnalysis, llm_summary: str | None = None) -> str:
+def build_markdown_report(analysis: RepoAnalysis, llm_sections: LlmResult | None = None) -> str:
     lines = [
         f"# Onboarding Report: {analysis.root.name}",
         "",
@@ -18,34 +21,22 @@ def build_markdown_report(analysis: RepoAnalysis, llm_summary: str | None = None
         "",
     ]
 
-    if llm_summary:
-        lines.extend(["## Agent-Erklaerung", llm_summary.strip(), ""])
+    if llm_sections and llm_sections.summary:
+        lines.extend(["## Kurzueberblick", llm_sections.summary.strip(), ""])
 
     lines.extend(
         [
-            "## Wie ist es aufgebaut?",
-            *_format_plain_items(analysis.module_hints),
-            "",
+            "## Projektstruktur",
             "### Strukturkarte",
             "```text",
-            *(analysis.tree or ["(keine Dateien gefunden)"]),
+            *_format_annotated_tree(analysis, llm_sections),
             "```",
             "",
-            "### Vermutete Architektur",
-            _architecture_summary(analysis),
+            "## Wie wird die Anwendung gestartet?",
+            *_format_startup_guide(analysis, llm_sections),
             "",
-            "## Wo soll ich anfangen zu lesen?",
-            *_format_reading_path(analysis),
-            "",
-            "## Wie starte/teste ich es lokal?",
-            _format_list("Test-Orte", analysis.test_locations),
-            *_format_command_hints(analysis),
-            "",
-            "## Sicher erkannt vs. vermutet",
-            *_format_confidence_notes(analysis),
-            "",
-            "## Relevante Snippets",
-            *_format_snippets(analysis),
+            "## Import-Beziehungen",
+            *_format_import_graph(analysis),
             "",
             "## Naechste Fragen an Maintainer",
             *_format_plain_items(analysis.maintainer_questions),
@@ -56,19 +47,6 @@ def build_markdown_report(analysis: RepoAnalysis, llm_summary: str | None = None
         ]
     )
     return "\n".join(lines)
-
-
-def _architecture_summary(analysis: RepoAnalysis) -> str:
-    if not analysis.languages:
-        return "Es wurden noch nicht genug Dateien gefunden, um eine Architektur abzuleiten."
-    primary = next(iter(analysis.languages))
-    hints = [f"Das Repo wirkt primaer wie ein {primary}-Projekt."]
-    if analysis.frameworks:
-        hints.append(f"Erkannte Frameworks/Tools: {', '.join(analysis.frameworks)}.")
-    if analysis.entry_points:
-        paths = ", ".join(f"`{item.path}`" for item in analysis.entry_points[:3])
-        hints.append(f"Die wahrscheinlichsten Einstiegspunkte sind {paths}.")
-    return " ".join(hints)
 
 
 def _format_mapping(mapping: dict[str, int]) -> list[str]:
@@ -87,63 +65,129 @@ def _format_important_files(items) -> list[str]:
     return [f"- `{item.path}`: {item.reason}" for item in items]
 
 
-def _format_reading_path(analysis: RepoAnalysis) -> list[str]:
+def _format_annotated_tree(analysis: RepoAnalysis, llm_sections: LlmResult | None) -> list[str]:
+    if not analysis.tree:
+        return ["(keine Dateien gefunden)"]
+
+    explanations = _parse_project_structure_explanations(llm_sections.project_structure if llm_sections else None)
     lines: list[str] = []
-    if analysis.important_files:
-        lines.append("- Erst diese Projektdateien lesen:")
-        lines.extend(f"  - `{item.path}`: {item.reason}" for item in analysis.important_files[:6])
-    if analysis.entry_points:
-        lines.append("- Danach diese Einstiegspunkte pruefen:")
-        lines.extend(f"  - `{item.path}`: {item.reason}" for item in analysis.entry_points[:6])
-    if not lines:
-        lines.append("- Keine klaren Startdateien erkannt.")
+    if not explanations and not llm_sections:
+        lines.append('"LLM-Projektstruktur ist im --no-llm Modus nicht verfuegbar."')
+    path_stack: list[str] = []
+    for tree_line in analysis.tree:
+        lines.append(tree_line)
+        depth = (len(tree_line) - len(tree_line.lstrip(" "))) // 2
+        name = tree_line.strip().removeprefix("- ").rstrip("/")
+        path_stack = path_stack[:depth]
+        path_stack.append(name)
+        path = "/".join(path_stack)
+        explanation = _explanation_for_path(path, name, explanations)
+        if explanation:
+            lines.append(f"{'  ' * (depth + 1)}\"{explanation}\"")
+    return lines
+
+
+def _parse_project_structure_explanations(project_structure: str | None) -> dict[str, str]:
+    if not project_structure:
+        return {}
+    explanations: dict[str, str] = {}
+    for raw_line in project_structure.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^(?:[-*]\s*)?`([^`]+)`\s*[:\-]\s*(.+)$", line)
+        if match:
+            path = match.group(1).strip().strip("/")
+            explanations[path] = _clean_explanation(match.group(2))
+            continue
+        match = re.match(r"^(?:[-*]\s*)?([^:]+?)\s*:\s*(.+)$", line)
+        if match and "/" in match.group(1):
+            path = match.group(1).strip().strip("` ").strip("/")
+            explanations[path] = _clean_explanation(match.group(2))
+    return explanations
+
+
+def _explanation_for_path(path: str, name: str, explanations: dict[str, str]) -> str | None:
+    candidates = [path, path.rstrip("/"), name, name.rstrip("/")]
+    for candidate in candidates:
+        if candidate in explanations:
+            return explanations[candidate]
+    return None
+
+
+def _clean_explanation(value: str) -> str:
+    return value.strip().strip('"').strip()
+
+
+def _format_startup_guide(analysis: RepoAnalysis, llm_sections: LlmResult | None) -> list[str]:
+    if llm_sections and llm_sections.startup_guide:
+        return [llm_sections.startup_guide.strip()]
+    hints = _startup_command_hints(analysis)
+    if hints:
+        return ["- LLM-Startanleitung ist im --no-llm Modus nicht verfuegbar.", "- Erkannte Start-nahe Kommandos:", *hints]
+    return ["- LLM-Startanleitung ist im --no-llm Modus nicht verfuegbar."]
+
+
+def _startup_command_hints(analysis: RepoAnalysis) -> list[str]:
+    keywords = ("dev", "start", "run", "serve", "preview", "build", "install", "setup", "docker")
+    hints = [*analysis.package_scripts, *analysis.make_targets, *analysis.command_hints]
+    lines: list[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        command_lower = hint.command.lower()
+        reason_lower = hint.reason.lower()
+        if not any(keyword in command_lower or keyword in reason_lower for keyword in keywords):
+            continue
+        if any(skip in command_lower for skip in ("test", "lint", "format", "clean")):
+            continue
+        if hint.command in seen:
+            continue
+        seen.add(hint.command)
+        lines.append(f"  - `{hint.command}`: {hint.reason}")
     return lines
 
 
 def _format_command_hints(analysis: RepoAnalysis) -> list[str]:
-    if not analysis.command_hints:
+    if not analysis.command_hints and not analysis.package_scripts and not analysis.make_targets:
         return ["- Kommandos: keine klaren Kommandos erkannt."]
-    lines = ["- Kommandos:"]
-    lines.extend(f"  - `{hint.command}`: {hint.reason}" for hint in analysis.command_hints)
-    return lines
-
-
-def _format_confidence_notes(analysis: RepoAnalysis) -> list[str]:
-    notes = [
-        f"- Sicher erkannt: {analysis.scanned_files} Dateien, {len(analysis.important_files)} wichtige Dateien, {len(analysis.entry_points)} moegliche Einstiegspunkte.",
-    ]
-    if analysis.languages:
-        notes.append(f"- Sicher erkannt: Dateiendungen deuten auf {', '.join(analysis.languages)} hin.")
-    if analysis.project_purpose:
-        notes.append("- Vermutet: Der Projektzweck wurde aus README oder Projektmetadaten abgeleitet.")
-    if analysis.frameworks:
-        notes.append("- Vermutet: Frameworks/Tools wurden aus Dependencies und Konfigurationsdateien abgeleitet.")
-    if analysis.command_hints:
-        notes.append("- Vermutet: Lokale Kommandos stammen aus bekannten Manifesten, Scripts oder Makefile-Zielen.")
-    return notes
-
-
-def _format_snippets(analysis: RepoAnalysis) -> list[str]:
-    if not analysis.file_snippets:
-        return ["- Keine sicheren Text-Snippets gesammelt."]
     lines: list[str] = []
-    for snippet in analysis.file_snippets[:8]:
-        suffix = " (gekuerzt)" if snippet.truncated else ""
-        lines.extend(
-            [
-                f"### `{snippet.path}`{suffix}",
-                f"_Warum relevant:_ {snippet.reason}",
-                "",
-                *_fenced_text(snippet.content or "(leer)"),
-                "",
-            ]
-        )
+    if analysis.package_scripts:
+        lines.append("- package.json Scripts:")
+        lines.extend(f"  - `{hint.command}`: {hint.reason}" for hint in analysis.package_scripts)
+    if analysis.make_targets:
+        lines.append("- Makefile-Ziele:")
+        lines.extend(f"  - `{hint.command}`: {hint.reason}" for hint in analysis.make_targets)
+    package_commands = {hint.command for hint in analysis.package_scripts}
+    make_commands = {hint.command for hint in analysis.make_targets}
+    other_hints = [
+        hint for hint in analysis.command_hints if hint.command not in package_commands and hint.command not in make_commands
+    ]
+    if other_hints:
+        lines.append("- Weitere Kommandos:")
+        lines.extend(f"  - `{hint.command}`: {hint.reason}" for hint in other_hints)
     return lines
 
 
-def _fenced_text(content: str) -> list[str]:
-    fence = "~~~" if "```" in content else "```"
-    return [f"{fence}text", content, fence]
+def _format_import_graph(analysis: RepoAnalysis) -> list[str]:
+    if not analysis.import_graph:
+        return ["- Keine Python-Import-Beziehungen erkannt."]
+    lines: list[str] = []
+    internal_lines: list[str] = []
+    external_lines: list[str] = []
+    for edge in analysis.import_graph[:20]:
+        if edge.internal_imports:
+            internal_lines.append(f"- `{edge.source}` -> {', '.join(f'`{module}`' for module in edge.internal_imports[:8])}")
+        external_imports = [module for module in edge.imports if module not in edge.internal_imports]
+        if external_imports:
+            external_lines.append(f"- `{edge.source}` -> {', '.join(f'`{module}`' for module in external_imports[:8])}")
+    lines.append("### Interne Imports")
+    lines.extend(internal_lines or ["- Keine internen Imports erkannt."])
+    lines.append("")
+    lines.append("### Externe Imports")
+    lines.extend(external_lines or ["- Keine externen Imports erkannt."])
+    if len(analysis.import_graph) > 20:
+        lines.append(f"- ... {len(analysis.import_graph) - 20} weitere Import-Knoten ausgelassen")
+    return lines
 
 
 def _format_plain_items(items: list[str]) -> list[str]:
